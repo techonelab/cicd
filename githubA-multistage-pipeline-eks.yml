@@ -1,0 +1,130 @@
+name: CICD
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+      - qa
+      - staging
+      - ^release.*
+      - ^feature.*
+
+jobs:
+  checkout:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+  check-commit-message:
+    runs-on: ubuntu-latest
+    needs: checkout
+    steps:
+      - name: Skip only
+        id: check-skip
+        run: |
+          git fetch --depth=1
+          commit_message=$(git rev-parse --abbrev-ref HEAD@{1} ^HEAD)
+          if [[ $commit_message =~ "skip-this" ]]; then
+            echo "Commit message contains 'skip-this'"
+            exit 1
+          fi
+
+  get-environment:
+    runs-on: ubuntu-latest
+    needs: checkout
+    steps:
+      - name: Check branch and parse it
+        id: get-updated-branch
+        run: |
+          git fetch
+          git rev-parse --abbrev-ref HEAD
+
+      - name: Check updated branch
+        uses: actions/if@v3
+        with:
+          condition: ${{ startsWith(steps.get-updated-branch.outputs.result, 'refs/heads/') }}
+          then:
+            steps:
+              - name: Get environment
+                id: get-environment
+                run: |
+                  echo "Environment: ${{ steps.get-updated-branch.outputs.result | split('/')[1] }}"
+
+  sast:
+    runs-on: ubuntu-latest
+    needs: get-environment
+    steps:
+      - name: Calling SonarQube...
+        if: ${{ steps.get-environment.outputs.result == 'dev' || steps.get-environment.outputs.result == 'qa' || startsWith(github.ref, 'refs/heads/^release.' || startsWith(github.ref, 'refs/heads/^feature.' }}
+        uses: actions/setup-sonar@v3
+        with:
+          sonar-host-url: YOUR_SONARQUBE_SERVER_URL
+          sonar-token: YOUR_SONARQUBE_TOKEN
+
+      - name: Scanning...
+        if: ${{ steps.get-environment.outputs.result == 'dev' || steps.get-environment.outputs.result == 'qa' || startsWith(github.ref, 'refs/heads/^release.' || startsWith(github.ref, 'refs/heads/^feature.' }}
+        uses: actions/sonar-scanner@v3
+        with:
+          sonar-scanner-version: 4.9.0
+          analysisPropertyFile: sonar-project.properties
+
+  assume-role:
+    runs-on: ubuntu-latest
+    needs: get-environment
+    steps:
+      - name: Assuming role...
+        id: assume-role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          role-to-assume: ${{ secrets.AWS_EKS_CLUSTER_ROLE_ARN }}
+
+  login-to-cluster:
+    runs-on: ubuntu-latest
+    needs: assume-role
+    steps:
+      - name: Accessing EKS cluster...
+        uses: aws-actions/amazon-eks-login@v2
+        with:
+          cluster-name: YOUR_EKS_CLUSTER_NAME
+          role-arn: ${{ steps.assume-role.outputs.roleArn }}
+
+  build-image:
+    runs-on: ubuntu-latest
+    needs: sast
+    steps:
+      - name: Building app...
+        if: ${{ steps.get-environment.outputs.result == 'dev' || steps.get-environment.outputs.result == 'qa' }}
+        run: |
+          docker build -t YOUR_IMAGE_NAME .
+
+  deploy-application:
+    runs-on: ubuntu-latest
+    needs: [sast, build-image, login-to-cluster]
+    steps:
+      - name: Deploy application to Kubernetes cluster
+        if: ${{ steps.get-environment.outputs.result == 'dev' || steps.get-environment.outputs.result == 'qa' || steps.get-environment.outputs.result == 'staging' || (steps.get-environment.outputs.result == 'main' && github.ref == 'refs/heads/main') }}
+        run: |
+          if [ "${{ steps.get-environment.outputs.result }} == 'dev' -a "${{ github.ref }} == 'refs/heads/dev' ]; then
+            kubectl apply -f deployment-dev.yaml
+          elif [ "${{ steps.get-environment.outputs.result }} == 'qa' -a "${{ github.ref }} == 'refs/heads/qa' ]; then
+            kubectl apply -f deployment-qa.yaml
+          elif [ "${{ steps.get-environment.outputs.result }} == 'staging' -a "${{ github.ref }} == 'refs/heads/staging' ]; then
+            kubectl apply -f deployment-staging.yaml
+          elif [ "${{ steps.get-environment.outputs.result }} == 'main' -a "${{ github.ref }} == 'refs/heads/main' ]; then
+            kubectl apply -f deployment-prod.yaml
+          fi
+
+  post-stage:
+    runs-on: ubuntu-latest
+    needs: deploy-application
+    steps:
+      - name: Send message to Teams channel
+        uses: Microsoft/Teams@v2.1.1
+        with:
+          message: ${{ github.event_name }}: ${{ github.ref }} - ${{ job.status }}
+          status: ${{ job.status }}

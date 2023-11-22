@@ -1,0 +1,143 @@
+pipeline{ 
+
+    agent {label  'jenkins-agent' }
+
+    environment { 
+        BRANCH_NAME = "${GIT_BRANCH}" 
+        commit = sh(script: 'git log --format=medium -1 --pretty=%B', returnStdout: true) 
+    } 
+
+    stages{ 
+        stage('checkout'){ 
+            steps{ 
+                sh 'echo ++++ fetching last feature branch ++++' 
+                checkout([$class: 'GitSCM', branches: [[name: env.GIT_BRANCH ]], extensions: [], userRemoteConfigs: [[credentialsId: /*'declare-variable-in-your-jenkins-and-call-it-here-mostly-this-is-a-service-account-or-shared-account-that-has-access-to-your-git-to-atleast-do-a-git-clone'*/, url: /*url-repo-here/app-directory*/]]]) 
+                sh 'sleep 1' 
+                } //end of steps 
+        } //end of checkout
+
+    stage('SonarQube Analysis') {
+            when { anyOf { 
+                environment name: 'GIT_BRANCH', value: 'origin/develop'; 
+                environment name: 'GIT_BRANCH', value: 'origin/qa'; 
+                environment name: 'GIT_BRANCH', value: 'origin/validation';
+                branch pattern: "origin/release.*" , comparator: "REGEXP" 
+            }   }
+            steps {
+                checkout([$class: 'GitSCM', branches: [[name: env.GIT_BRANCH ]], extensions: [], userRemoteConfigs: [[credentialsId: /*'declare-variable-in-your-jenkins-and-call-it-here-mostly-this-is-a-service-account-or-shared-account-that-has-access-to-your-git-to-atleast-do-a-git-clone'*/, url: /*url-repo-here/app-directory*/]]]) 
+                withSonarQubeEnv(/*'given-you-configured-sonarqube-plugin-in-your-jenkins-already-call-the-name-you-config-in-jenkins-console-here'*/){
+                    sh 'sonar\-scanner'
+                    }
+                }
+            }
+
+        stage('build'){  
+            when {  environment name: 'GIT_BRANCH', value: 'origin/develop'; } 
+            steps{ 
+                withCredentials([file(credentialsId: /*'credentials-to-use-here-is-needed-tobe-set-in-jenkins-mostly-this-'*/, variable: /*'name-of-the-variable-set-in-jenkins-console'*/)]) {
+                sh 'sudo docker build -t gcr.io/<project-name-here>/<another-directory-here-depends-on-your-structure>/<actual-image-name-here>:${GIT_COMMIT} -f <directory-to-your-Dockerfile-here> .' 
+                sh 'chmod 600 <name-of-the-variable-set-in-jenkins-console>' 
+                sh 'cat $<name-of-the-variable-set-in-jenkins-console> | sudo docker login -u _json_key --password-stdin https://gcr.io' 
+                sh 'sudo docker push gcr.io/<project-name-here>/<another-directory-here-depends-on-your-structure>/<actual-image-name-here>:${GIT_COMMIT}' 
+                } 
+            } //end of steps 
+        } //end of build and push 
+
+        //deployment stage per environment
+        //dev environment will skip if branch is not develop or release following the pattern
+        stage('DEV'){ 
+            when { environment name: 'GIT_BRANCH', value: 'origin/develop' } 
+            steps{ 
+                withCredentials([file(credentialsId: /*'credentials-to-use-here-is-needed-tobe-set-in-jenkins-mostly-this-'*/, variable: /*'name-of-the-variable-set-in-jenkins-console'*/)]) { 
+                sh 'chmod 600 $<name-of-the-variable-set-in-jenkins-console>' 
+                sh 'gcloud auth login --cred-file=$<name-of-the-variable-set-in-jenkins-console>' 
+                sh 'gcloud config set project <your-project-name>'              
+                sh 'gcloud container clusters get-credentials <designated-namespace-per-env> --region asia-east2-b --project <your-project-name>' 
+                sh 'kubectl config set-context $(kubectl config current-context) --namespace=<designated-namespace-per-env>' 
+                sh 'sleep 30' 
+                sh 'kubectl rollout history deployment/<your-app-name>' 
+                sh "kubectl set image deployment/<your-app-name> <your-app-name>=gcr.io/<project-name-here>/<another-directory-here-depends-on-your-structure>/<actual-image-name-here>:\$(gcloud container images list-tags gcr.io/<project-name-here>/<another-directory-here-depends-on-your-structure>/<actual-image-name-here> | head -n 2 | awk 'NR==2{print\$2}')" 
+                sh 'kubectl annotate deployment <your-app-name> kubernetes.io/change-cause="latest build deployed to dev" --record=false --overwrite=true' 
+                sh 'kubectl rollout status -w deployment/<your-app-name>' 
+                sh 'sleep 60' 
+                script{ //this was added because the app of our project requires migrate after new update at some point
+                    if("${env.commit}".contains('**MIGRATE**')){ 
+                        sh "kubectl exec -i \$(kubectl get pods -l app=<your-app-name> | awk 'NR==2{print\$1}') -c <your-app-name> -- python -m <app-name>.migrate" 
+                    }else{ 
+                        sh "echo no need to run MIGRATE script" 
+                    } 
+                } 
+                }//end of with
+            } //end of step 
+        } //end of deploy to DEV 
+        //validation or staging environment, will skip if branch is not validation
+        stage('VALIDATION'){ 
+            when { environment name: 'GIT_BRANCH', value: 'origin/validation' } 
+            steps{ 
+                withCredentials([file(credentialsId: /*'credentials-to-use-here-is-needed-tobe-set-in-jenkins-mostly-this-'*/, variable: /*'name-of-the-variable-set-in-jenkins-console'*/)]) { 
+                sh 'chmod 600 $<name-of-the-variable-set-in-jenkins-console>' 
+                sh 'gcloud auth login --cred-file=$<name-of-the-variable-set-in-jenkins-console>' 
+                sh 'gcloud config set project <your-project-name>'              
+                sh 'gcloud container clusters get-credentials <designated-namespace-per-env> --region asia-east2-b --project <your-project-name>' 
+                sh 'kubectl config set-context $(kubectl config current-context) --namespace=<designated-namespace-per-env>' 
+                sh 'sleep 30' 
+                sh 'kubectl rollout history deployment/<your-app-name>' 
+                sh "kubectl set image deployment/<your-app-name> <your-app-name>=gcr.io/<project-name-here>/<another-directory-here-depends-on-your-structure>/<actual-image-name-here>:\$(gcloud container images list-tags gcr.io/<project-name-here>/<another-directory-here-depends-on-your-structure>/<actual-image-name-here> | head -n 2 | awk 'NR==2{print\$2}')" 
+                sh 'kubectl annotate deployment <your-app-name> kubernetes.io/change-cause="latest build deployed to dev" --record=false --overwrite=true' 
+                sh 'kubectl rollout status -w deployment/<your-app-name>' 
+                sh 'sleep 60' 
+                script{ //this was added because the app of our project requires migrate after new update at some point
+                    if("${env.commit}".contains('**MIGRATE**')){ 
+                        sh "kubectl exec -i \$(kubectl get pods -l app=<your-app-name> | awk 'NR==2{print\$1}') -c <your-app-name> -- python -m <app-name>.migrate" 
+                    }else{ 
+                        sh "echo no need to run MIGRATE script" 
+                    } 
+                } 
+                }//end of with
+            } //end of step 
+        } //end of deploy to VALIDATION environment
+        //production environment will skipp is branch is not main
+        //this also is having a faster run of pipeline because no sast is done as sast and linting is only done on lower environment depends on your process
+        stage('PRODUCTION'){ 
+            when { environment name: 'GIT_BRANCH', value: 'origin/main' } 
+            steps{ 
+                withCredentials([file(credentialsId: /*'credentials-to-use-here-is-needed-tobe-set-in-jenkins-mostly-this-'*/, variable: /*'name-of-the-variable-set-in-jenkins-console'*/)]) { 
+                sh 'chmod 600 $<name-of-the-variable-set-in-jenkins-console>' 
+                sh 'gcloud auth login --cred-file=$<name-of-the-variable-set-in-jenkins-console>' 
+                sh 'gcloud config set project <your-project-name>'              
+                sh 'gcloud container clusters get-credentials <designated-namespace-per-env> --region asia-east2-b --project <your-project-name>' 
+                sh 'kubectl config set-context $(kubectl config current-context) --namespace=<designated-namespace-per-env>' 
+                sh 'sleep 30' 
+                sh 'kubectl rollout history deployment/<your-app-name>' 
+                sh "kubectl set image deployment/<your-app-name> <your-app-name>=gcr.io/<project-name-here>/<another-directory-here-depends-on-your-structure>/<actual-image-name-here>:\$(gcloud container images list-tags gcr.io/<project-name-here>/<another-directory-here-depends-on-your-structure>/<actual-image-name-here> | head -n 2 | awk 'NR==2{print\$2}')" 
+                sh 'kubectl annotate deployment <your-app-name> kubernetes.io/change-cause="latest build deployed to dev" --record=false --overwrite=true' 
+                sh 'kubectl rollout status -w deployment/<your-app-name>' 
+                sh 'sleep 60' 
+                script{ //this was added because the app of our project requires migrate after new update at some point
+                    if("${env.commit}".contains('**MIGRATE**')){ 
+                        sh "kubectl exec -i \$(kubectl get pods -l app=<your-app-name> | awk 'NR==2{print\$1}') -c <your-app-name> -- python -m <app-name>.migrate" 
+                    }else{ 
+                        sh "echo no need to run MIGRATE script" 
+                    } 
+                } 
+                }//end of with
+            } //end of step 
+        } //end of deploy to DEV  
+
+    } //end of stages 
+
+    post{ 
+        success{ 
+            slackSend (color: '#00FF00', message: "${env.commit} from Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]' (${env.BUILD_URL})") 
+        } 
+
+        failure{ 
+            slackSend (color: '#FF0000', message: "${env.commit} from Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]' (${env.BUILD_URL})") 
+        } 
+
+        aborted{ 
+            slackSend (color: '#00FF00', message: "${env.commit} from Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]' (${env.BUILD_URL})") 
+        }
+    }// end of slack notification 
+
+}
